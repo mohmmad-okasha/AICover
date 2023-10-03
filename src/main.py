@@ -179,9 +179,10 @@ def preprocess_song(song_input, mdx_model_params, song_id, is_webui, input_type,
     orig_song_path = convert_to_stereo(orig_song_path)
 
     vocals_path=orig_song_path
-    main_vocals_path=None
-    backup_vocals_path=None
-    instrumentals_path=None
+    main_vocals_path=orig_song_path
+    backup_vocals_path=orig_song_path
+    main_vocals_dereverb_path=orig_song_path
+    instrumentals_path=orig_song_path
 
     # display_progress('[~] Separating Vocals from Instrumental...', 0.1, is_webui, progress)
     # vocals_path, instrumentals_path = run_mdx(mdx_model_params, song_output_dir, os.path.join(mdxnet_models_dir, 'UVR-MDX-NET-Voc_FT.onnx'), orig_song_path, denoise=True, keep_orig=keep_orig)
