@@ -1,86 +1,85 @@
-import pathlib
-from pathlib import Path
-class SongCoverPipeline:
-    def __init__(self, base_dir, mdxnet_models_dir, rvc_models_dir, output_dir):
-        self.base_dir = base_dir
-        self.mdxnet_models_dir = mdxnet_models_dir
-        self.rvc_models_dir = rvc_models_dir
-        self.output_dir = output_dir
+import argparse
+import gc
+import hashlib
+import json
+import os
+import shlex
+import subprocess
+from contextlib import suppress
+from urllib.parse import urlparse, parse_qs
 
-    def get_rvc_model(self, voice_model, is_webui):
-        rvc_model_filename, rvc_index_filename = None, None
-        model_dir = Path(self.rvc_models_dir) / voice_model
-        for file in model_dir.iterdir():
-            ext = file.suffix
-            if ext == '.pth':
-                rvc_model_filename = file.name
-            if ext == '.index':
-                rvc_index_filename = file.name
+import gradio as gr
+import librosa
+import numpy as np
+import soundfile as sf
+import sox
+import yt_dlp
+from pedalboard import Pedalboard, Reverb, Compressor, HighpassFilter
+from pedalboard.io import AudioFile
+from pydub import AudioSegment
 
-        if rvc_model_filename is None:
-            error_msg = f'No model file exists in {model_dir}.'
-            raise_exception(error_msg, is_webui)
+from mdx import run_mdx
+from rvc import Config, load_hubert, get_vc, rvc_infer
 
-        return model_dir / rvc_model_filename, model_dir / rvc_index_filename if rvc_index_filename else ''
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-pipeline = SongCoverPipeline(base_dir, mdxnet_models_dir, rvc_models_dir, output_dir)
-pipeline.get_rvc_model(voice_model, is_webui)
-
-DEFAULT_PITCH_CHANGE = 0
-DEFAULT_F0_METHOD = 'rmvpe'
-DEFAULT_INDEX_RATE = 0.5
-DEFAULT_FILTER_RADIUS = 3
-DEFAULT_RMS_MIX_RATE = 0.25
-DEFAULT_PROTECT = 0.33
-DEFAULT_CREPE_HOP_LENGTH = 128
-
-def voice_change(voice_model, vocals_path, output_path, pitch_change=DEFAULT_PITCH_CHANGE, f0_method=DEFAULT_F0_METHOD, index_rate=DEFAULT_INDEX_RATE, filter_radius=DEFAULT_FILTER_RADIUS, rms_mix_rate=DEFAULT_RMS_MIX_RATE, protect=DEFAULT_PROTECT, crepe_hop_length=DEFAULT_CREPE_HOP_LENGTH, is_webui):
-    rvc_model_path, rvc_index_path = get_rvc_model(voice_model, is_webui)
-    device = 'cuda:0'
-    config = Config(device, True)
-    hubert_model = load_hubert(device, config.is_half, Path(rvc_models_dir) / 'hubert_base.pt')
-    cpt, version, net_g, tgt_sr, vc = get_vc(device, config.is_half, config, rvc_model_path)
-    rvc_infer(rvc_index_path, index_rate, vocals_path, output_path, pitch_change, f0_method, cpt, version, net_g, filter_radius, tgt_sr, rms_mix_rate, protect, crepe_hop_length, vc, hubert_model)
-    del hubert_model, cpt
-    gc.collect()
+mdxnet_models_dir = os.path.join(BASE_DIR, 'mdxnet_models')
+rvc_models_dir = os.path.join(BASE_DIR, 'rvc_models')
+#output_dir = os.path.join(BASE_DIR, 'song_output')
+output_dir = os.path.join('/content/drive/MyDrive/', 'voice_output')
 
 def get_youtube_video_id(url, ignore_playlist=True):
+    """
+    Examples:
+    http://youtu.be/SA2iWivDJiE
+    http://www.youtube.com/watch?v=_oPAwA_Udwc&feature=feedu
+    http://www.youtube.com/embed/SA2iWivDJiE
+    http://www.youtube.com/v/SA2iWivDJiE?version=3&amp;hl=en_US
+    """
     query = urlparse(url)
-    hostname = query.hostname
-    path = query.path
+    if query.hostname == 'youtu.be':
+        if query.path[1:] == 'watch':
+            return query.query[2:]
+        return query.path[1:]
 
-    mapping = {
-        'youtu.be': {
-            'watch': query.query[2:],
-            'default': query.path[1:]
-        },
-        'www.youtube.com': {
-            'watch': parse_qs(query.query)['v'][0],
-            'watch/': query.path.split('/')[1],
-            'embed/': query.path.split('/')[2],
-            'v/': query.path.split('/')[2]
-        },
-        'youtube.com': {
-            'watch': parse_qs(query.query)['v'][0],
-            'watch/': query.path.split('/')[1],
-            'embed/': query.path.split('/')[2],
-            'v/': query.path.split('/')[2]
-        },
-        'music.youtube.com': {
-            'watch': parse_qs(query.query)['v'][0],
-            'watch/': query.path.split('/')[1],
-            'embed/': query.path.split('/')[2],
-            'v/': query.path.split('/')[2]
-        }
-    }
-
-    if hostname in mapping:
-        if path in mapping[hostname]:
-            return mapping[hostname][path]
-        elif not ignore_playlist:
+    if query.hostname in {'www.youtube.com', 'youtube.com', 'music.youtube.com'}:
+        if not ignore_playlist:
+            # use case: get playlist id not current video in playlist
             with suppress(KeyError):
                 return parse_qs(query.query)['list'][0]
+        if query.path == '/watch':
+            return parse_qs(query.query)['v'][0]
+        if query.path[:7] == '/watch/':
+            return query.path.split('/')[1]
+        if query.path[:7] == '/embed/':
+            return query.path.split('/')[2]
+        if query.path[:3] == '/v/':
+            return query.path.split('/')[2]
+
+    # returns None for invalid YouTube url
     return None
+
+
+def yt_download(link):
+    ydl_opts = {
+        'format': 'bestaudio',
+        'outtmpl': '%(title)s',
+        'nocheckcertificate': True,
+        'ignoreerrors': True,
+        'no_warnings': True,
+        'quiet': True,
+        'extractaudio': True,
+        'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}],
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        result = ydl.extract_info(link, download=True)
+        download_path = ydl.prepare_filename(result, outtmpl='%(title)s.mp3')
+
+    return download_path
+
+
+def raise_exception(error_msg, is_webui):
+    if is_webui:
         raise gr.Error(error_msg)
     else:
         raise Exception(error_msg)
@@ -104,43 +103,23 @@ def get_rvc_model(voice_model, is_webui):
 
 
 def get_audio_paths(song_dir):
-    """
-    Get the paths of the audio files in the given directory.
+    orig_song_path = None
+    instrumentals_path = None
+    main_vocals_dereverb_path = None
+    backup_vocals_path = None
 
-    Args:
-        song_dir (str): The directory containing the audio files.
+    for file in os.listdir(song_dir):
+        if file.endswith('_Instrumental.wav'):
+            instrumentals_path = os.path.join(song_dir, file)
+            orig_song_path = instrumentals_path.replace('_Instrumental', '')
 
-    Returns:
-        tuple: A tuple containing the paths of the original song, instrumentals, main vocals dereverb, and backup vocals.
-    """
-    # Check if the directory exists and is a directory
-    if os.path.exists(song_dir) and os.path.isdir(song_dir):
-        # Use os.listdir() instead of os.scandir()
-        file_names = os.listdir(song_dir)
+        elif file.endswith('_Vocals_Main_DeReverb.wav'):
+            main_vocals_dereverb_path = os.path.join(song_dir, file)
 
-        # Use a dictionary to map file types to their respective paths
-        file_types = {
-            '_Instrumental.wav': 'instrumentals_path',
-            '_Vocals_Main_DeReverb.wav': 'main_vocals_dereverb_path',
-            '_Vocals_Backup.wav': 'backup_vocals_path'
-        }
+        elif file.endswith('_Vocals_Backup.wav'):
+            backup_vocals_path = os.path.join(song_dir, file)
 
-        audio_paths = {}
-
-        for file_name in file_names:
-            for file_type, path_variable in file_types.items():
-                if file_name.endswith(file_type):
-                    audio_paths[path_variable] = os.path.join(song_dir, file_name)
-                    if file_type == '_Instrumental.wav':
-                        audio_paths['orig_song_path'] = audio_paths[path_variable].replace('_Instrumental', '')
-
-        # Check if all required audio files are found
-        if 'orig_song_path' not in audio_paths or 'instrumentals_path' not in audio_paths or 'main_vocals_dereverb_path' not in audio_paths or 'backup_vocals_path' not in audio_paths:
-            raise Exception("Required audio files not found in the directory.")
-
-        return audio_paths['orig_song_path'], audio_paths['instrumentals_path'], audio_paths['main_vocals_dereverb_path'], audio_paths['backup_vocals_path']
-    else:
-        return None, None, None, None
+    return orig_song_path, instrumentals_path, main_vocals_dereverb_path, backup_vocals_path
 
 
 def convert_to_stereo(audio_path):
@@ -186,74 +165,34 @@ def display_progress(message, percent, is_webui, progress=None):
 
 def preprocess_song(song_input, mdx_model_params, song_id, is_webui, input_type, progress=None):
     keep_orig = False
-    
-    input_type_to_function = {
-        'yt': yt_download,
-        'local': lambda x: x
-    }
-    orig_song_path = input_type_to_function.get(input_type, lambda _: None)(song_input)
+    if input_type == 'yt':
+        display_progress('[~] Downloading song...', 0, is_webui, progress)
+        song_link = song_input.split('&')[0]
+        orig_song_path = yt_download(song_link)
+    elif input_type == 'local':
+        orig_song_path = song_input
+        keep_orig = True
+    else:
+        orig_song_path = None
 
-    song_output_dir = pathlib.Path(output_dir) / song_id
+    song_output_dir = os.path.join(output_dir, song_id)
     orig_song_path = convert_to_stereo(orig_song_path)
 
-    tasks = [
-        {
-            'message': '[~] Separating Vocals from Instrumental...',
-            'percent': 0.1,
-            'function': run_mdx,
-            'params': {
-                'mdx_model_params': mdx_model_params,
-                'song_output_dir': song_output_dir,
-                'model_path': vocals_model_path,
-                'input_path': orig_song_path,
-                'denoise': True,
-                'keep_orig': keep_orig
-            }
-        },
-        {
-            'message': '[~] Separating Main Vocals from Backup Vocals...',
-            'percent': 0.2,
-            'function': run_mdx,
-            'params': {
-                'mdx_model_params': mdx_model_params,
-                'song_output_dir': song_output_dir,
-                'model_path': os.path.join(mdxnet_models_dir, 'UVR_MDXNET_KARA_2.onnx'),
-                'input_path': vocals_path,
-                'suffix': 'Backup',
-                'invert_suffix': 'Main',
-                'denoise': True
-            }
-        },
-        {
-            'message': '[~] Applying DeReverb to Vocals...',
-            'percent': 0.3,
-            'function': run_mdx,
-            'params': {
-                'mdx_model_params': mdx_model_params,
-                'song_output_dir': song_output_dir,
-                'model_path': os.path.join(mdxnet_models_dir, 'Reverb_HQ_By_FoxJoy.onnx'),
-                'input_path': main_vocals_path,
-                'invert_suffix': 'DeReverb',
-                'exclude_main': True,
-                'denoise': True
-            }
-        }
-    ]
+    vocals_path=orig_song_path
+    main_vocals_path=None
+    backup_vocals_path=None
+    instrumentals_path=None
 
-    results = {}
-    for task in tasks:
-        display_progress(task['message'], task['percent'], is_webui, progress)
-        result = task['function'](**task['params'])
-        results[task['message']] = result
+    # display_progress('[~] Separating Vocals from Instrumental...', 0.1, is_webui, progress)
+    # vocals_path, instrumentals_path = run_mdx(mdx_model_params, song_output_dir, os.path.join(mdxnet_models_dir, 'UVR-MDX-NET-Voc_FT.onnx'), orig_song_path, denoise=True, keep_orig=keep_orig)
 
-    return {
-        'orig_song_path': orig_song_path,
-        'vocals_path': results['[~] Separating Vocals from Instrumental...'][0],
-        'instrumentals_path': results['[~] Separating Vocals from Instrumental...'][1],
-        'main_vocals_path': results['[~] Separating Main Vocals from Backup Vocals...'][1],
-        'backup_vocals_path': results['[~] Separating Main Vocals from Backup Vocals...'][0],
-        'main_vocals_dereverb_path': results['[~] Applying DeReverb to Vocals...'][1]
-    }
+    # display_progress('[~] Separating Main Vocals from Backup Vocals...', 0.2, is_webui, progress)
+    # backup_vocals_path, main_vocals_path = run_mdx(mdx_model_params, song_output_dir, os.path.join(mdxnet_models_dir, 'UVR_MDXNET_KARA_2.onnx'), vocals_path, suffix='Backup', invert_suffix='Main', denoise=True)
+
+    display_progress('[~] Applying DeReverb to Vocals...', 0.3, is_webui, progress)
+    _, main_vocals_dereverb_path = run_mdx(mdx_model_params, song_output_dir, os.path.join(mdxnet_models_dir, 'Reverb_HQ_By_FoxJoy.onnx'), main_vocals_path, invert_suffix='DeReverb', exclude_main=True, denoise=True)
+
+    return orig_song_path, vocals_path, instrumentals_path, main_vocals_path, backup_vocals_path, main_vocals_dereverb_path
 
 
 def voice_change(voice_model, vocals_path, output_path, pitch_change, f0_method, index_rate, filter_radius, rms_mix_rate, protect, crepe_hop_length, is_webui):
