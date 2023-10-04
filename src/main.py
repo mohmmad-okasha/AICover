@@ -8,7 +8,6 @@ import subprocess
 from contextlib import suppress
 from urllib.parse import urlparse, parse_qs
 
-import torch
 import gradio as gr
 import librosa
 import numpy as np
@@ -200,9 +199,7 @@ def preprocess_song(de_reverb,song_input, mdx_model_params, song_id, is_webui, i
 
 def voice_change(voice_model, vocals_path, output_path, pitch_change, f0_method, index_rate, filter_radius, rms_mix_rate, protect, crepe_hop_length, is_webui):
     rvc_model_path, rvc_index_path = get_rvc_model(voice_model, is_webui)
-    #device = 'cuda:0'
-    # Use GPU if available
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    device = 'cuda:0'
 
     config = Config(device, True)
     hubert_model = load_hubert(device, config.is_half, os.path.join(rvc_models_dir, 'hubert_base.pt'))
