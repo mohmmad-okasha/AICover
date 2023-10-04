@@ -8,6 +8,7 @@ import subprocess
 from contextlib import suppress
 from urllib.parse import urlparse, parse_qs
 
+import torch
 import gradio as gr
 import librosa
 import numpy as np
@@ -190,7 +191,7 @@ def preprocess_song(de_reverb,song_input, mdx_model_params, song_id, is_webui, i
 
     # display_progress('[~] Separating Main Vocals from Backup Vocals...', 0.2, is_webui, progress)
     # backup_vocals_path, main_vocals_path = run_mdx(mdx_model_params, song_output_dir, os.path.join(mdxnet_models_dir, 'UVR_MDXNET_KARA_2.onnx'), vocals_path, suffix='Backup', invert_suffix='Main', denoise=True)
-    if(de_reverb==1):
+    if(de_reverb=='1'):
         display_progress('[~] Applying DeReverb to Vocals...', 0.3, is_webui, progress)
         _, main_vocals_dereverb_path = run_mdx(mdx_model_params, song_output_dir, os.path.join(mdxnet_models_dir, 'Reverb_HQ_By_FoxJoy.onnx'), main_vocals_path, invert_suffix='DeReverb', exclude_main=True, denoise=True)
 
@@ -199,13 +200,20 @@ def preprocess_song(de_reverb,song_input, mdx_model_params, song_id, is_webui, i
 
 def voice_change(voice_model, vocals_path, output_path, pitch_change, f0_method, index_rate, filter_radius, rms_mix_rate, protect, crepe_hop_length, is_webui):
     rvc_model_path, rvc_index_path = get_rvc_model(voice_model, is_webui)
-    device = 'cuda:0'
+    #device = 'cuda:0'
+    # Use GPU if available
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
     config = Config(device, True)
     hubert_model = load_hubert(device, config.is_half, os.path.join(rvc_models_dir, 'hubert_base.pt'))
     cpt, version, net_g, tgt_sr, vc = get_vc(device, config.is_half, config, rvc_model_path)
 
     # convert main vocals
-    rvc_infer(rvc_index_path, index_rate, vocals_path, output_path, pitch_change, f0_method, cpt, version, net_g, filter_radius, tgt_sr, rms_mix_rate, protect, crepe_hop_length, vc, hubert_model)
+    try:
+        rvc_infer(rvc_index_path, index_rate, vocals_path, output_path, pitch_change, f0_method, cpt, version, net_g, filter_radius, tgt_sr, rms_mix_rate, protect, crepe_hop_length, vc, hubert_model)
+    except Exception as e:
+        # Handle the exception here, e.g. log the error message or perform error recovery actions
+        print(f"An error occurred during 'rvc_infer': {str(e)}")
     del hubert_model, cpt
     gc.collect()
 
@@ -310,7 +318,7 @@ def song_cover_pipeline(de_reverb,song_input, voice_model, pitch_change, keep_fi
 
         if not keep_files:
             display_progress('[~] Removing intermediate audio files...', 0.95, is_webui, progress)
-            intermediate_files = [vocals_path, main_vocals_path, ai_vocals_mixed_path]
+            intermediate_files = [vocals_path, main_vocals_path]
             if pitch_change_all != 0:
                 intermediate_files += [instrumentals_path, backup_vocals_path]
             for file in intermediate_files:
